@@ -1,92 +1,140 @@
 ﻿"""PySpark analytics for the ecommerce-data-pipeline project.
 
-Loads raw Parquet files, computes business insights, and writes processed Parquet results.
+This module defines SalesAnalytics for loading data and computing revenue
+analytics using local Spark and optimized serialization.
 """
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
+from typing import Optional
 
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
-
-from .config import CONFIG
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 
-def create_spark_session(app_name: str = CONFIG.SPARK_APP_NAME) -> SparkSession:
-    """Create and return a SparkSession configured for local execution."""
-    return (
-        SparkSession.builder.appName(app_name)
-        .master('local[*]')
-        .config('spark.sql.shuffle.partitions', '8')
-        .getOrCreate()
-    )
+class SalesAnalytics:
+    """Sales analytics tools for PySpark revenue analysis."""
 
+    def __init__(self, app_name: str = "SalesAnalytics", master: str = "local[*]", memory: str = "4g") -> None:
+        """Initialize the analytics helper with Spark settings."""
+        self.app_name = app_name
+        self.master = master
+        self.memory = memory
+        self.spark: Optional[SparkSession] = None
 
-def _save_table(df, path: Path) -> None:
-    """Save a Spark DataFrame to Parquet with overwrite mode."""
-    df.write.mode('overwrite').parquet(str(path))
-    logger.info('Wrote analytics output to %s', path)
+    def _verify_java(self) -> None:
+        """Ensure Java is installed and available before creating a SparkSession."""
+        if shutil.which("java") is None:
+            raise RuntimeError(
+                "Java executable not found. Install a JDK, set JAVA_HOME, or add java to PATH. "
+                "Then restart your terminal and rerun the script."
+            )
 
+    def create_spark_session(self) -> SparkSession:
+        """Create a SparkSession configured for local execution and Kryo serialization."""
+        self._verify_java()
+        logger.info("Creating SparkSession: app=%s master=%s memory=%s", self.app_name, self.master, self.memory)
+        self.spark = (
+            SparkSession.builder.appName(self.app_name)
+            .master(self.master)
+            .config("spark.driver.memory", self.memory)
+            .config("spark.executor.memory", self.memory)
+            .config("spark.sql.adaptive.enabled", "true")
+            .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+            .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+            .config("spark.kryoserializer.buffer.max", "512m")
+            .getOrCreate()
+        )
+        return self.spark
 
-def run_analytics(spark: SparkSession, raw_dir: Path = CONFIG.RAW_DIR, processed_dir: Path = CONFIG.PROCESSED_DIR) -> None:
-    """Load raw data, compute analytics, and save processed outputs."""
-    logger.info('Starting analytics from %s to %s', raw_dir, processed_dir)
+    def stop_spark(self) -> None:
+        """Stop the SparkSession if it is running."""
+        if self.spark is not None:
+            logger.info("Stopping SparkSession")
+            self.spark.stop()
+            self.spark = None
 
-    customers = spark.read.parquet(str(raw_dir / 'customers.parquet'))
-    products = spark.read.parquet(str(raw_dir / 'products.parquet'))
-    orders = spark.read.parquet(str(raw_dir / 'orders.parquet'))
+    def load_parquet(self, path: str | Path) -> DataFrame:
+        """Load a Parquet dataset from the specified path."""
+        if self.spark is None:
+            self.create_spark_session()
 
-    enriched = orders.join(products, on='product_id', how='left').withColumn(
-        'revenue', F.col('price') * F.col('quantity')
-    )
+        logger.info("Loading Parquet file from %s", path)
+        return self.spark.read.parquet(str(path))
 
-    processed_dir.mkdir(parents=True, exist_ok=True)
+    def top_customers_by_revenue(self, orders_df: DataFrame, products_df: DataFrame, n: int = 10) -> DataFrame:
+        """Return the top N customers ranked by total revenue."""
+        logger.info("Calculating top %d customers by revenue", n)
+        enriched = orders_df.join(products_df, on="product_id", how="left")
+        revenue_df = enriched.withColumn("revenue", F.col("price") * F.col("quantity"))
+        result = (
+            revenue_df.groupBy("customer_id")
+            .agg(
+                F.sum("revenue").alias("total_revenue"),
+                F.sum("quantity").alias("units_purchased"),
+            )
+            .orderBy(F.desc("total_revenue"))
+            .limit(n)
+        )
+        return result
 
-    revenue_by_category = (
-        enriched.groupBy('category')
-        .agg(F.sum('revenue').alias('revenue'))
-        .orderBy(F.desc('revenue'))
-    )
-    _save_table(revenue_by_category, processed_dir / 'revenue_by_category.parquet')
+    def sales_by_category(self, orders_df: DataFrame, products_df: DataFrame) -> DataFrame:
+        """Aggregate total revenue and units sold by product category."""
+        logger.info("Calculating sales by category")
+        enriched = orders_df.join(products_df, on="product_id", how="left")
+        result = (
+            enriched.withColumn("revenue", F.col("price") * F.col("quantity"))
+            .groupBy("category")
+            .agg(
+                F.sum("revenue").alias("total_revenue"),
+                F.sum("quantity").alias("units_sold"),
+            )
+            .orderBy(F.desc("total_revenue"))
+        )
+        return result
 
-    customer_sales = enriched.join(customers, on='customer_id', how='left')
-    top_customers = (
-        customer_sales.groupBy('customer_id', 'name', 'email')
-        .agg(F.sum('revenue').alias('total_revenue'))
-        .orderBy(F.desc('total_revenue'))
-    )
-    _save_table(top_customers, processed_dir / 'top_customers.parquet')
+    def monthly_trends(self, orders_df: DataFrame, products_df: DataFrame) -> DataFrame:
+        """Calculate month-over-month revenue growth percentage."""
+        logger.info("Calculating monthly revenue trends")
+        enriched = orders_df.join(products_df, on="product_id", how="left")
+        revenue_by_month = (
+            enriched.withColumn("month", F.date_format(F.col("order_date"), "yyyy-MM"))
+            .withColumn("revenue", F.col("price") * F.col("quantity"))
+            .groupBy("month")
+            .agg(F.sum("revenue").alias("month_revenue"))
+            .orderBy("month")
+        )
 
-    monthly_sales = (
-        enriched.withColumn('month', F.date_format(F.col('order_date'), 'yyyy-MM'))
-        .groupBy('month')
-        .agg(F.sum('revenue').alias('revenue'))
-        .orderBy('month')
-    )
-    _save_table(monthly_sales, processed_dir / 'monthly_sales.parquet')
-
-    sales_by_country = (
-        customer_sales.groupBy('country')
-        .agg(F.sum('revenue').alias('revenue'))
-        .orderBy(F.desc('revenue'))
-    )
-    _save_table(sales_by_country, processed_dir / 'sales_by_country.parquet')
-
-    logger.info('Completed analytics and saved processed results.')
+        month_window = Window.orderBy("month")
+        result = (
+            revenue_by_month
+            .withColumn("previous_month_revenue", F.lag("month_revenue").over(month_window))
+            .withColumn(
+                "revenue_growth_pct",
+                F.when(F.col("previous_month_revenue").isNull(), None).otherwise(
+                    (F.col("month_revenue") - F.col("previous_month_revenue"))
+                    / F.col("previous_month_revenue")
+                    * 100.0
+                ),
+            )
+        )
+        return result
 
 
 def main() -> None:
-    """Run the Spark analytics pipeline from the command line."""
-    spark = create_spark_session()
+    """Demonstrate Spark session creation and class initialization."""
+    analytics = SalesAnalytics()
+    spark = analytics.create_spark_session()
     try:
-        run_analytics(spark)
+        logger.info("Spark version: %s", spark.version)
     finally:
-        spark.stop()
+        analytics.stop_spark()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

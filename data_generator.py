@@ -230,14 +230,16 @@ class SyntheticDataGenerator:
         reg_dates = customers.set_index("customer_id")["registration_date"].to_dict()
 
         # vectorized compute: get registration_date for each order
-        reg_array = np.array([reg_dates[int(cid)] for cid in tqdm(customer_ids, desc="mapping reg dates")])
+        reg_array = pd.to_datetime(
+            np.array([reg_dates[int(cid)] for cid in tqdm(customer_ids, desc="mapping reg dates")])
+        ).astype('datetime64[ns]')
         # days from registration to now
-        days_range = (now - pd.to_datetime(reg_array)).dt.days.clip(lower=0).values
+        days_range = np.clip((now.to_datetime64() - reg_array).astype('timedelta64[D]').astype(int), 0, None)
         # sample offset days and seconds
         rand_days = np.floor(np.random.uniform(0, 1, size=n_orders) * (days_range + 1)).astype(int)
         rand_seconds = np.random.randint(0, 24 * 3600, size=n_orders)
 
-        order_dates = pd.to_datetime(reg_array) + pd.to_timedelta(rand_days, unit="D") + pd.to_timedelta(rand_seconds, unit="s")
+        order_dates = reg_array + pd.to_timedelta(rand_days, unit="D") + pd.to_timedelta(rand_seconds, unit="s")
 
         orders = pd.DataFrame(
             {

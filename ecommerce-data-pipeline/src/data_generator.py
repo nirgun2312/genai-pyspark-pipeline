@@ -150,14 +150,16 @@ class SyntheticDataGenerator:
         quantities = np.random.randint(1, 11, size=n_orders, dtype=np.int16)
 
         registration_lookup = customers.set_index('customer_id')['registration_date'].to_dict()
-        reg_array = np.array([np.datetime64(registration_lookup[int(cid)]) for cid in customer_ids], dtype='datetime64[ns]')
+        reg_array = pd.to_datetime(
+            np.array([registration_lookup[int(cid)] for cid in customer_ids])
+        ).astype('datetime64[ns]')
 
-        now = np.datetime64('now')
+        now = np.datetime64('now', 'ns')
         available_days = np.maximum((now - reg_array).astype('timedelta64[D]').astype(int), 0)
         rand_days = np.array([np.random.randint(0, int(days) + 1) for days in available_days], dtype=np.int32)
         rand_seconds = np.random.randint(0, 24 * 3600, size=n_orders, dtype=np.int32)
 
-        order_dates = pd.to_datetime(reg_array + rand_days.astype('timedelta64[D]') + rand_seconds.astype('timedelta64[s]'))
+        order_dates = reg_array + rand_days.astype('timedelta64[D]') + rand_seconds.astype('timedelta64[s]')
 
         return pd.DataFrame(
             {
